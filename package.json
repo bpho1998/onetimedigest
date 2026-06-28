@@ -1,0 +1,14 @@
+{
+  "name": "sf-fillmore-digest-bot",
+  "version": "1.0.0",
+  "description": "Weekly intelligence digest synthesizing SF open data on Mehta/Fillmore activity for reporters",
+  "main": "src/digest.js",
+  "scripts": {
+    "start": "node src/digest.js",
+    "test": "DISCORD_WEBHOOK_URL= node src/digest.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
