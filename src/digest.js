@@ -1,27 +1,18 @@
 /**
  * SF Fillmore Research Report — One-time comprehensive intelligence snapshot.
  *
- * MATCHING STRATEGY:
+ * MATCHING STRATEGY (field-aware):
  *
- * The key insight: we want records *about* Mehta/Fillmore, not records *from*
- * lobbyists who happen to also work on Fillmore. So matching rules differ by
- * source and field:
+ * LOBBYIST: match on client name or description containing subject terms.
+ *   Agent terms (Lighthouse, Peterson) only count when a subject term also
+ *   appears in the same record.
  *
- * LOBBYIST ACTIVITY:
- *   - Match on CLIENT name fields (clientname) → any term
- *   - Match on SUBJECT/DESCRIPTION fields (description) → property/org terms only
- *   - Do NOT match on lobbyist/firm name alone — that pulls all their clients
+ * CAMPAIGN FINANCE: match ONLY on contributor/filer name containing
+ *   subject terms (Mehta, Fillmore Reserve, Aegis Reserve, etc.).
+ *   Do NOT match on employer = Lighthouse Public Affairs — that pulls
+ *   all their unrelated political work.
  *
- * CAMPAIGN FINANCE:
- *   - Match on CONTRIBUTOR name (transaction_first_name, transaction_last_name)
- *   - Match on EMPLOYER (transaction_employer)
- *   - Match on RECIPIENT/FILER (filer_name)
- *   - Do NOT match on occupation alone
- *
- * BUILDING PERMITS:
- *   - Match on DESCRIPTION text and STREET NAME
- *   - "Fillmore" in street_name will catch all Fillmore St permits
- *   - Narrow to Fillmore St address range 2000-2299 to avoid false positives
+ * BUILDING PERMITS: match on 2000–2299 Fillmore St address block.
  */
 
 const https = require("https");
@@ -29,8 +20,7 @@ const https = require("https");
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
 const SINCE_DATE = process.env.SINCE_DATE || "2018-01-01";
 
-// Terms that identify the SUBJECT of a filing (client, property, org)
-// Used for matching against client names, descriptions, contributor names
+// Subject terms — identify the actual Mehta/Fillmore entities
 const SUBJECT_TERMS = [
   "Upper Fillmore Revitalization",
   "Aegis Reserve",
@@ -48,8 +38,8 @@ const SUBJECT_TERMS = [
   "White Birches LLC",
 ];
 
-// Terms that identify a FIRM/PERSON acting on behalf of Mehta interests
-// Only used for lobbyist firm/name fields when the client is also identified
+// Agent terms — lobbyists/firms acting for Mehta interests
+// Used ONLY in lobbyist source, and only when subject term also present
 const AGENT_TERMS = [
   "Lighthouse Public Affairs",
   "Peterson, Rich",
@@ -57,7 +47,6 @@ const AGENT_TERMS = [
 
 const ALL_TERMS = [...SUBJECT_TERMS, ...AGENT_TERMS];
 
-// Fillmore St address range for permit matching (2000–2299 Fillmore)
 const FILLMORE_RANGE = { street: "fillmore", min: 2000, max: 2299 };
 
 // ─── HTTP ─────────────────────────────────────────────────────────────────────
@@ -90,71 +79,47 @@ function postJSON(url, body) {
   });
 }
 
-// ─── Matching — field-aware ───────────────────────────────────────────────────
+// ─── Matching ─────────────────────────────────────────────────────────────────
 
 function termIn(value, terms) {
   const v = (value || "").toString().toLowerCase();
   return terms.filter((t) => v.includes(t.toLowerCase()));
 }
 
-/**
- * Lobbyist records: match if ANY subject term appears in the client name,
- * OR if an agent term appears in the firm/lobbyist name AND a subject term
- * appears anywhere in the record (confirming it's Fillmore-related work).
- */
 function matchLobbyist(row) {
-  // Primary: client name contains a subject term
-  const clientMatches = termIn(row.clientname, SUBJECT_TERMS);
-  if (clientMatches.length > 0) return clientMatches;
-
-  // Secondary: description contains a subject term
-  const descMatches = termIn(row.description, SUBJECT_TERMS);
-  if (descMatches.length > 0) return descMatches;
-
-  // Tertiary: agent (firm/lobbyist) AND some other field confirms subject
+  // Primary: client name or description contains a subject term
+  const clientHits = termIn(row.clientname, SUBJECT_TERMS);
+  if (clientHits.length > 0) return clientHits;
+  const descHits = termIn(row.description, SUBJECT_TERMS);
+  if (descHits.length > 0) return descHits;
+  // Secondary: agent term present AND subject term anywhere else in record
   const isAgent = termIn(row.firmname, AGENT_TERMS).length > 0 ||
                   termIn(row.lobbyistname, AGENT_TERMS).length > 0;
   if (isAgent) {
-    // Only include if another field also references a subject term
     const allText = [row.clientname, row.description, row.candidatename, row.employeename]
       .map((f) => (f || "").toLowerCase()).join(" ");
-    const subjectConfirm = SUBJECT_TERMS.filter((t) => allText.includes(t.toLowerCase()));
-    if (subjectConfirm.length > 0) {
-      return [...termIn(row.firmname, AGENT_TERMS), ...termIn(row.lobbyistname, AGENT_TERMS)];
-    }
+    const subjectHits = SUBJECT_TERMS.filter((t) => allText.includes(t.toLowerCase()));
+    if (subjectHits.length > 0) return subjectHits;
   }
-
   return [];
 }
 
-/**
- * Campaign finance: match contributor name, employer, or recipient/filer name.
- * Do not match on occupation alone.
- */
 function matchFinance(row) {
-  const contributor = [row.transaction_first_name, row.transaction_last_name].join(" ");
-  return [
-    ...termIn(row.filer_name, ALL_TERMS),
-    ...termIn(contributor, ALL_TERMS),
-    ...termIn(row.transaction_employer, ALL_TERMS),
-    ...termIn(row.transaction_description, SUBJECT_TERMS),
-  ].filter((v, i, a) => a.indexOf(v) === i); // dedupe
+  // Only match on contributor name, filer/recipient name, or transaction description
+  // containing SUBJECT terms. Do NOT match on employer = Lighthouse (unrelated work).
+  const filerHits = termIn(row.filer_name, SUBJECT_TERMS);
+  const contributor = [row.transaction_first_name, row.transaction_last_name].filter(Boolean).join(" ");
+  const contribHits = termIn(contributor, SUBJECT_TERMS);
+  const descHits = termIn(row.transaction_description, SUBJECT_TERMS);
+  return [...new Set([...filerHits, ...contribHits, ...descHits])];
 }
 
-/**
- * Building permits: match description text OR Fillmore St address range.
- */
 function matchPermit(row) {
-  const descMatches = termIn(row.description, SUBJECT_TERMS);
-  if (descMatches.length > 0) return descMatches;
-
-  // Check if address is on Fillmore St in the relevant block range
   const street = (row.street_name || "").toLowerCase();
   const num = parseInt(row.street_number || "0", 10);
   if (street === FILLMORE_RANGE.street && num >= FILLMORE_RANGE.min && num <= FILLMORE_RANGE.max) {
-    return ["Fillmore St 2000-2299 block"];
+    return [`${row.street_number} Fillmore St`];
   }
-
   return [];
 }
 
@@ -163,98 +128,86 @@ function matchPermit(row) {
 async function fetchAndMatch() {
   const results = { lobbyist_activity: [], campaign_finance: [], building_permits: [] };
 
-  // Lobbyist activity
+  // Lobbyist
   console.log("\n📡 Fetching lobbyist_activity…");
-  {
-    let offset = 0, total = 0;
-    const url_base = "https://data.sfgov.org/resource/s4ub-8j3t.json";
-    while (true) {
-      const where = encodeURIComponent(`date >= '${SINCE_DATE}'`);
-      const url = `${url_base}?$where=${where}&$order=${encodeURIComponent("date ASC")}&$limit=1000&$offset=${offset}`;
-      let rows;
-      try { rows = await fetchJSON(url); } catch (e) { console.error(`  ❌ ${e.message}`); break; }
-      if (!Array.isArray(rows) || rows.length === 0) break;
-      total += rows.length;
-      for (const row of rows) {
-        const terms = matchLobbyist(row);
-        if (terms.length > 0) {
-          const link = row.fromfiling
-            ? `https://netfile.com/app/lobbyist/filing/${row.fromfiling}/report`
-            : "https://netfile.com/lobbyistpub/#sfo";
-          results.lobbyist_activity.push({ row, terms, link });
-        }
-      }
-      if (rows.length < 1000) break;
-      offset += 1000;
-      await new Promise((r) => setTimeout(r, 300));
+  await paginate(
+    "https://data.sfgov.org/resource/s4ub-8j3t.json", "date",
+    (row) => {
+      const terms = matchLobbyist(row);
+      if (terms.length > 0) results.lobbyist_activity.push({
+        row, terms,
+        link: row.fromfiling
+          ? `https://netfile.com/app/lobbyist/filing/${row.fromfiling}/report`
+          : "https://netfile.com/lobbyistpub/#sfo",
+      });
     }
-    console.log(`  ↳ ${total} rows → ${results.lobbyist_activity.length} matches`);
-  }
+  );
+  console.log(`  ↳ ${results.lobbyist_activity.length} matches`);
 
   // Campaign finance
   console.log("\n📡 Fetching campaign_finance…");
-  {
-    let offset = 0, total = 0;
-    const url_base = "https://data.sfgov.org/resource/pitq-e56w.json";
-    while (true) {
-      const where = encodeURIComponent(`filing_date >= '${SINCE_DATE}'`);
-      const url = `${url_base}?$where=${where}&$order=${encodeURIComponent("filing_date ASC")}&$limit=1000&$offset=${offset}`;
-      let rows;
-      try { rows = await fetchJSON(url); } catch (e) { console.error(`  ❌ ${e.message}`); break; }
-      if (!Array.isArray(rows) || rows.length === 0) break;
-      total += rows.length;
-      for (const row of rows) {
-        const terms = matchFinance(row);
-        if (terms.length > 0) {
-          const link = row.filing_id_number
-            ? `https://netfile.com/pub2/api/filing/${row.filing_id_number}/detail?aid=sfo`
-            : "https://sfethics.org/disclosures/campaign-finance-disclosure";
-          results.campaign_finance.push({ row, terms, link });
-        }
-      }
-      if (rows.length < 1000) break;
-      offset += 1000;
-      await new Promise((r) => setTimeout(r, 300));
+  await paginate(
+    "https://data.sfgov.org/resource/pitq-e56w.json", "filing_date",
+    (row) => {
+      const terms = matchFinance(row);
+      if (terms.length > 0) results.campaign_finance.push({
+        row, terms,
+        link: row.filing_id_number
+          ? `https://netfile.com/pub2/api/filing/${row.filing_id_number}/detail?aid=sfo`
+          : "https://sfethics.org/disclosures/campaign-finance-disclosure",
+      });
     }
-    console.log(`  ↳ ${total} rows → ${results.campaign_finance.length} matches`);
-  }
+  );
+  console.log(`  ↳ ${results.campaign_finance.length} matches`);
 
   // Building permits
   console.log("\n📡 Fetching building_permits…");
-  {
-    let offset = 0, total = 0;
-    const url_base = "https://data.sfgov.org/resource/i98e-djp9.json";
-    while (true) {
-      const where = encodeURIComponent(`filed_date >= '${SINCE_DATE}'`);
-      const url = `${url_base}?$where=${where}&$order=${encodeURIComponent("filed_date ASC")}&$limit=1000&$offset=${offset}`;
-      let rows;
-      try { rows = await fetchJSON(url); } catch (e) { console.error(`  ❌ ${e.message}`); break; }
-      if (!Array.isArray(rows) || rows.length === 0) break;
-      total += rows.length;
-      for (const row of rows) {
-        const terms = matchPermit(row);
-        if (terms.length > 0) {
-          const link = row.permit_number
-            ? `https://dbiweb02.sfgov.org/dbipts/default.aspx?permit=${row.permit_number}`
-            : "https://sfdbi.org/dbipts";
-          results.building_permits.push({ row, terms, link });
-        }
-      }
-      if (rows.length < 1000) break;
-      offset += 1000;
-      await new Promise((r) => setTimeout(r, 300));
+  await paginate(
+    "https://data.sfgov.org/resource/i98e-djp9.json", "filed_date",
+    (row) => {
+      const terms = matchPermit(row);
+      if (terms.length > 0) results.building_permits.push({
+        row, terms,
+        link: row.permit_number
+          ? `https://dbiweb02.sfgov.org/dbipts/default.aspx?permit=${row.permit_number}`
+          : "https://sfdbi.org/dbipts",
+      });
     }
-    console.log(`  ↳ ${total} rows → ${results.building_permits.length} matches`);
-  }
+  );
+  console.log(`  ↳ ${results.building_permits.length} matches`);
 
   return results;
 }
 
-// ─── Embed builder ────────────────────────────────────────────────────────────
+async function paginate(baseUrl, dateField, onRow) {
+  let offset = 0, total = 0;
+  while (true) {
+    const where = encodeURIComponent(`${dateField} >= '${SINCE_DATE}'`);
+    const order = encodeURIComponent(`${dateField} ASC`);
+    const url = `${baseUrl}?$where=${where}&$order=${order}&$limit=1000&$offset=${offset}`;
+    let rows;
+    try { rows = await fetchJSON(url); } catch (e) { console.error(`  ❌ ${e.message}`); break; }
+    if (!Array.isArray(rows) || rows.length === 0) break;
+    total += rows.length;
+    rows.forEach(onRow);
+    if (rows.length < 1000) break;
+    offset += 1000;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  console.log(`  ↳ ${total} rows scanned`);
+}
+
+// ─── Embed helpers ────────────────────────────────────────────────────────────
+
+// Truncate at a clean newline boundary, never mid-sentence
+function smartTruncate(text, max) {
+  if (text.length <= max) return text;
+  const cut = text.lastIndexOf("\n", max - 10);
+  return (cut > max * 0.6 ? text.slice(0, cut) : text.slice(0, max - 3)) + "…";
+}
 
 function embed(title, color, description, footerText) {
-  const MAX = 2000;
-  const d = description.length > MAX ? description.slice(0, MAX - 1) + "…" : description;
+  const d = smartTruncate(description, 2000);
   const e = { title: title.slice(0, 100), color, description: d };
   if (footerText) e.footer = { text: footerText.slice(0, 200) };
   return e;
@@ -263,13 +216,12 @@ function embed(title, color, description, footerText) {
 const b = (s) => `**${s}**`;
 const m = (s) => `\`${s}\``;
 
-// ─── Section: Cover ───────────────────────────────────────────────────────────
+// ─── Cover ────────────────────────────────────────────────────────────────────
 
 function coverEmbed(matches, runDate) {
   const lob = matches.lobbyist_activity.length;
   const fin = matches.campaign_finance.length;
   const per = matches.building_permits.length;
-
   const allDates = [
     ...matches.lobbyist_activity.map(({ row }) => row.date),
     ...matches.campaign_finance.map(({ row }) => row.filing_date),
@@ -285,153 +237,151 @@ function coverEmbed(matches, runDate) {
     `**💰 Campaign finance:** ${fin} transactions\n` +
     `**🏗 Permit matches:** ${per}\n` +
     `**🏠 Property recordings:** No public API — search https://recorder.sfgov.org\n\n` +
-    `**Tracked entities:** ${ALL_TERMS.map(m).join(" ")}`,
+    `**Tracked entities:**\n${ALL_TERMS.map(m).join(" ")}`,
     "SF Fillmore Report • DataSF • One-time snapshot"
   );
 }
 
-// ─── Section: Lobbying ────────────────────────────────────────────────────────
+// ─── Lobbying ─────────────────────────────────────────────────────────────────
 
 function lobbyingEmbed(lob) {
   if (lob.length === 0) return embed("🏛 1. Lobbying Activity", 0xe74c3c,
     "No lobbying records found where the client or subject matter references tracked entities.\n\n🔗 https://netfile.com/lobbyistpub/#sfo");
 
   const dates = lob.map(({ row }) => row.date).filter(Boolean).map((d) => d.slice(0, 10)).sort();
+  const firms = [...new Set(lob.map(({ row }) => row.firmname).filter(Boolean))];
+  const lobbyists = [...new Set(lob.map(({ row }) => row.lobbyistname).filter(Boolean))];
 
   // Group by client
   const byClient = new Map();
   for (const { row, link } of lob) {
     const client = row.clientname || "Unknown";
-    const firm = row.firmname || "—";
-    const lobbyist = row.lobbyistname || "—";
-    const date = (row.date || "").slice(0, 10);
-    if (!byClient.has(client)) byClient.set(client, { count: 0, firms: new Set(), lobbyists: new Set(), first: date, last: date, officials: new Set(), link });
+    if (!byClient.has(client)) byClient.set(client, { count: 0, firms: new Set(), first: "9999", last: "0000", officials: new Set(), link });
     const e = byClient.get(client);
     e.count++;
-    e.firms.add(firm);
-    e.lobbyists.add(lobbyist);
+    if (row.firmname) e.firms.add(row.firmname);
+    const date = (row.date || "").slice(0, 10);
     if (date < e.first) e.first = date;
     if (date > e.last) e.last = date;
     const off = row.employeename || row.candidatename;
-    // Filter out obviously non-official values
-    if (off && off.length > 3 && !off.includes("LLC") && !off.includes("INC") && !/^\d/.test(off)) {
-      e.officials.add(off);
-    }
+    if (off && off.length > 3 && !off.match(/LLC|INC|^\d|MEASURE|PROP/i)) e.officials.add(off);
   }
 
-  const firms = [...new Set(lob.map(({ row }) => row.firmname).filter(Boolean))];
-  const lobbyists = [...new Set(lob.map(({ row }) => row.lobbyistname).filter(Boolean))];
-
   let desc =
-    `**${lob.length} filings** | ${dates[0]?.slice(0,7) || "—"} → ${dates[dates.length-1]?.slice(0,7) || "—"}\n` +
+    `**${lob.length} filings** | ${dates[0]?.slice(0,7)} → ${dates[dates.length-1]?.slice(0,7)}\n` +
     `**Firms:** ${firms.join(", ")}\n` +
     `**Lobbyists:** ${lobbyists.join(", ")}\n\n` +
     `**By client:**\n`;
 
   for (const [client, { count, firms: f, first, last, officials, link }] of
     [...byClient.entries()].sort((a, b) => b[1].count - a[1].count)) {
-    desc += `• ${b(client)}: ${count} filings (${first.slice(0,7)}→${last.slice(0,7)}) via ${[...f].join(", ")} [↗](${link})\n`;
+    desc += `• ${b(client)}: ${count} filings (${first.slice(0,7)} → ${last.slice(0,7)}) [↗](${link})\n`;
+    desc += `  via ${[...f].join(", ")}\n`;
     if (officials.size > 0) {
-      desc += `  _Officials contacted: ${[...officials].slice(0,4).join(", ")}${officials.size > 4 ? ` +${officials.size-4} more` : ""}_\n`;
+      desc += `  _Officials: ${[...officials].slice(0,4).join(", ")}${officials.size > 4 ? ` +${officials.size-4}` : ""}_\n`;
     }
   }
 
-  desc += `\n🔗 Full filings: https://netfile.com/lobbyistpub/#sfo`;
+  desc += `\n🔗 https://netfile.com/lobbyistpub/#sfo`;
   return embed("🏛 1. Lobbying Activity", 0xe74c3c, desc);
 }
 
-// ─── Section: Campaign Finance ────────────────────────────────────────────────
+// ─── Campaign Finance ─────────────────────────────────────────────────────────
 
 function financeEmbed(fin) {
   if (fin.length === 0) return embed("💰 2. Campaign Finance", 0x27ae60,
-    "No campaign finance records found.\n\n🔗 https://sfethics.org/disclosures/campaign-finance-disclosure");
+    "No campaign finance records found where a tracked entity is the contributor or recipient.\n\n🔗 https://sfethics.org/disclosures/campaign-finance-disclosure");
 
   const total = fin.reduce((s, { row }) => s + Number(row.transaction_amount_1 || 0), 0);
-  const dates = fin.map(({ row }) => (row.transaction_date || row.filing_date || "")).filter(Boolean).map((d) => d.slice(0, 10)).sort();
+  const dates = fin.map(({ row }) => (row.transaction_date || row.filing_date || ""))
+    .filter(Boolean).map((d) => d.slice(0, 10)).sort();
 
-  // By recipient
+  // Group by recipient
   const byRecipient = new Map();
   for (const { row, link } of fin) {
     const rec = row.filer_name || "Unknown";
-    if (!byRecipient.has(rec)) byRecipient.set(rec, { total: 0, count: 0, link, contribs: [] });
+    if (!byRecipient.has(rec)) byRecipient.set(rec, { total: 0, count: 0, link, items: [] });
     const amt = Number(row.transaction_amount_1 || 0);
+    const contrib = [row.transaction_first_name, row.transaction_last_name].filter(Boolean).join(" ") || "Unknown";
+    const date = (row.transaction_date || row.filing_date || "").slice(0, 10);
     byRecipient.get(rec).total += amt;
     byRecipient.get(rec).count++;
-    const name = [row.transaction_first_name, row.transaction_last_name].filter(Boolean).join(" ") || "Unknown";
-    byRecipient.get(rec).contribs.push({ name, employer: row.transaction_employer || "", amount: amt,
-      date: (row.transaction_date || row.filing_date || "").slice(0, 10) });
+    byRecipient.get(rec).items.push({ contrib, amt, date, link });
   }
+
+  // Sort recipients by total, cap at 8
+  const sortedRecipients = [...byRecipient.entries()]
+    .sort((a, b) => b[1].total - a[1].total)
+    .slice(0, 8);
 
   let desc =
     `**${fin.length} transactions** | **Total: $${total.toLocaleString()}**\n` +
     `${dates[0]?.slice(0,7) || "—"} → ${dates[dates.length-1]?.slice(0,7) || "—"}\n\n` +
-    `**By recipient committee:**\n`;
+    `**By recipient (top 8 by amount):**\n`;
 
-  for (const [rec, { total: t, count, link, contribs }] of
-    [...byRecipient.entries()].sort((a, b) => b[1].total - a[1].total)) {
+  for (const [rec, { total: t, count, link, items }] of sortedRecipients) {
     desc += `• ${b(rec)}: $${t.toLocaleString()} (${count}) [↗](${link})\n`;
-    // Show top contributors to this committee
-    const top = contribs.sort((a, b) => b.amount - a.amount).slice(0, 3);
-    for (const { name, employer, amount, date } of top) {
-      desc += `  _${name}${employer ? ` (${employer})` : ""}: $${amount.toLocaleString()} on ${date}_\n`;
+    // Show top 2 contributors to each recipient
+    const topItems = items.sort((a, b) => b.amt - a.amt).slice(0, 2);
+    for (const { contrib, amt, date } of topItems) {
+      desc += `  _${contrib}: $${amt.toLocaleString()} on ${date}_\n`;
     }
   }
 
+  const remaining = byRecipient.size - 8;
+  if (remaining > 0) desc += `• …and ${remaining} more recipients\n`;
   desc += `\n🔗 https://sfethics.org/disclosures/campaign-finance-disclosure`;
+
   return embed("💰 2. Campaign Finance", 0x27ae60, desc);
 }
 
-// ─── Section: Building Permits ────────────────────────────────────────────────
+// ─── Building Permits ─────────────────────────────────────────────────────────
 
 function permitsEmbed(per) {
   if (per.length === 0) return embed("🏗 3. Building Permits", 0xf39c12,
-    "No permit matches found on the 2000–2299 Fillmore St block or in permit descriptions.\n\n" +
-    "_Note: DBI dataset has no applicant/owner name fields — LLC names are not searchable here._\n\n" +
-    "🔗 Search manually: https://sfdbi.org/dbipts");
+    "No permit matches found on the 2000–2299 Fillmore St block.\n\n🔗 https://sfdbi.org/dbipts");
 
   const dates = per.map(({ row }) => row.filed_date).filter(Boolean).map((d) => d.slice(0, 10)).sort();
+
   const statusCounts = new Map();
   for (const { row } of per) {
     const s = row.status || "unknown";
     statusCounts.set(s, (statusCounts.get(s) || 0) + 1);
   }
 
-  // Sort by date descending
-  const sorted = per.sort((a, b) => (b.row.filed_date || "").localeCompare(a.row.filed_date || ""));
+  const totalCost = per.reduce((s, { row }) => s + Number(row.estimated_cost || 0), 0);
+
+  const sorted = [...per].sort((a, b) =>
+    (b.row.filed_date || "").localeCompare(a.row.filed_date || ""));
 
   let desc =
-    `**${per.length} permit(s)** on 2000–2299 Fillmore St block\n` +
-    `${dates[0]?.slice(0,7) || "—"} → ${dates[dates.length-1]?.slice(0,7) || "—"}\n` +
-    `**Status:** ${[...statusCounts.entries()].map(([s, n]) => `${s}: ${n}`).join(" | ")}\n\n` +
-    `**Most recent permits:**\n`;
+    `**${per.length} permit(s)** on 2000–2299 Fillmore St | ${dates[0]?.slice(0,7)} → ${dates[dates.length-1]?.slice(0,7)}\n` +
+    `**Est. total value:** $${totalCost.toLocaleString()}\n` +
+    `**Status breakdown:** ${[...statusCounts.entries()].map(([s, n]) => `${s}: ${n}`).join(" | ")}\n\n` +
+    `**Most recent 10 permits:**\n`;
 
-  for (const { row, link } of sorted.slice(0, 12)) {
-    const addr = [row.street_number, row.street_name].filter(Boolean).join(" ");
+  for (const { row, link } of sorted.slice(0, 10)) {
+    const addr = row.street_number ? `${row.street_number} Fillmore` : "Fillmore";
     const date = (row.filed_date || "").slice(0, 10);
     const cost = row.estimated_cost ? ` $${Number(row.estimated_cost).toLocaleString()}` : "";
-    const workDesc = (row.description || "—").slice(0, 70);
-    desc += `• ${b(addr)} | ${row.status || "—"} | ${date}${cost} [↗](${link})\n  _${workDesc}_\n`;
+    const workDesc = (row.description || "—").slice(0, 65);
+    desc += `• ${b(addr)} | ${row.status || "—"} | ${date}${cost} [↗](${link})\n`;
+    desc += `  _${workDesc}_\n`;
   }
-  if (per.length > 12) desc += `• …and ${per.length - 12} more\n`;
+  if (per.length > 10) desc += `• …and ${per.length - 10} more permits\n`;
   desc += `\n🔗 https://sfdbi.org/dbipts`;
 
   return embed("🏗 3. Building Permits", 0xf39c12, desc);
 }
 
-// ─── Section: Entity Network ──────────────────────────────────────────────────
+// ─── Entity Network ───────────────────────────────────────────────────────────
 
 function networkEmbed(matches) {
   const counts = new Map(ALL_TERMS.map((t) => [t, 0]));
   const srcs = new Map(ALL_TERMS.map((t) => [t, new Set()]));
   const labels = { lobbyist_activity: "L", campaign_finance: "F", building_permits: "P" };
 
-  const sourceMap = {
-    lobbyist_activity: matches.lobbyist_activity,
-    campaign_finance: matches.campaign_finance,
-    building_permits: matches.building_permits,
-  };
-
-  for (const [srcId, records] of Object.entries(sourceMap)) {
+  for (const [srcId, records] of Object.entries(matches)) {
     for (const { terms } of records) {
       for (const t of terms) {
         if (counts.has(t)) {
@@ -447,20 +397,17 @@ function networkEmbed(matches) {
 
   let desc =
     `**${ranked.length} of ${ALL_TERMS.length}** tracked entities appear in public records.\n\n` +
-    `**Record count (L=Lobbying F=Finance P=Permits):**\n` +
-    ranked.map(([t, c]) => {
-      const s = [...(srcs.get(t) || [])].map((x) => labels[x]).sort().join("");
-      return `• ${b(t)}: ${c} [${s}]`;
-    }).join("\n");
+    `**Record count** (L=Lobbying F=Finance P=Permits):\n` +
+    ranked.map(([t, c]) => `• ${b(t)}: ${c} [${[...(srcs.get(t)||[])].map((s) => labels[s]).sort().join("")}]`).join("\n");
 
   if (inactive.length > 0) {
-    desc += `\n\n**No records yet for:**\n${inactive.map(m).join(" ")}`;
+    desc += `\n\n**No records yet:**\n${inactive.map(m).join(" ")}`;
   }
 
   return embed("🕸 4. Entity Network", 0x2980b9, desc);
 }
 
-// ─── Section: Reporter Briefing ───────────────────────────────────────────────
+// ─── Reporter's Briefing ──────────────────────────────────────────────────────
 
 function briefingEmbed(matches, runDate) {
   const lob = matches.lobbyist_activity;
@@ -471,47 +418,61 @@ function briefingEmbed(matches, runDate) {
   const firms = [...new Set(lob.map(({ row }) => row.firmname).filter(Boolean))];
   const lobbyists = [...new Set(lob.map(({ row }) => row.lobbyistname).filter(Boolean))];
   const clients = [...new Set(lob.map(({ row }) => row.clientname).filter(Boolean))];
-
-  // Officials — filter noise
   const officials = [...new Set(
     lob.map(({ row }) => row.employeename || row.candidatename)
-      .filter((o) => o && o.length > 3 && !o.includes("LLC") && !o.includes("INC") && !/^\d/.test(o))
+      .filter((o) => o && o.length > 3 && !o.match(/LLC|INC|^\d|MEASURE|PROP/i))
   )];
 
   const totalMoney = fin.reduce((s, { row }) => s + Number(row.transaction_amount_1 || 0), 0);
-  const recipients = [...new Set(fin.map(({ row }) => row.filer_name).filter(Boolean))];
+
+  // Top 5 recipients only for briefing
+  const recipientTotals = new Map();
+  for (const { row } of fin) {
+    const rec = row.filer_name || "Unknown";
+    recipientTotals.set(rec, (recipientTotals.get(rec) || 0) + Number(row.transaction_amount_1 || 0));
+  }
+  const topRecipients = [...recipientTotals.entries()]
+    .sort((a, b) => b[1] - a[1]).slice(0, 5)
+    .map(([r, t]) => `${r} ($${t.toLocaleString()})`);
+  const extraRecipients = recipientTotals.size - 5;
+
+  const totalPermitCost = per.reduce((s, { row }) => s + Number(row.estimated_cost || 0), 0);
 
   const lines = [];
 
   if (lob.length > 0) {
     lines.push(
       `**Lobbying:** ${firms.join(" and ")} (${lobbyists.join(", ")}) filed **${lob.length} lobbying disclosures** ` +
-      `on behalf of ${clients.join(", ")} from ${lobDates[0]?.slice(0,7) || "—"} to ${lobDates[lobDates.length-1]?.slice(0,7) || "—"}. ` +
+      `on behalf of ${clients.join(", ")} ` +
+      `from ${lobDates[0]?.slice(0,7) || "—"} to ${lobDates[lobDates.length-1]?.slice(0,7) || "—"}. ` +
       (officials.length > 0
-        ? `City officials contacted include **${officials.slice(0,5).join(", ")}**${officials.length > 5 ? ` and ${officials.length-5} others` : ""}.`
-        : "No city official contact records in this dataset.")
+        ? `City officials contacted: **${officials.slice(0,5).join(", ")}**${officials.length > 5 ? ` (+${officials.length-5} more)` : ""}.`
+        : "No official contact records in dataset.")
     );
   } else {
-    lines.push("**Lobbying:** No lobbying records found for tracked clients or subject matter.");
+    lines.push("**Lobbying:** No records found for tracked clients.");
   }
 
   if (fin.length > 0) {
     lines.push(
-      `**Political money:** **$${totalMoney.toLocaleString()}** across **${fin.length} transactions** ` +
-      `flowing to: ${recipients.join(", ")}.`
+      `**Political money:** **$${totalMoney.toLocaleString()}** across **${fin.length} transactions**. ` +
+      `Top recipients: ${topRecipients.join("; ")}${extraRecipients > 0 ? `; +${extraRecipients} more` : ""}.`
     );
   } else {
-    lines.push("**Political money:** No campaign finance records found for tracked entities.");
+    lines.push("**Political money:** No records found for tracked entities as contributor or recipient.");
   }
 
   if (per.length > 0) {
-    lines.push(`**Construction:** **${per.length} building permit(s)** filed on the 2000–2299 Fillmore St block.`);
+    lines.push(
+      `**Construction:** **${per.length} building permit(s)** on the 2000–2299 Fillmore St block, ` +
+      `with estimated total value of **$${totalPermitCost.toLocaleString()}**.`
+    );
   } else {
-    lines.push("**Construction:** No permit matches on the 2000–2299 Fillmore St block.");
+    lines.push("**Construction:** No permits found on the 2000–2299 Fillmore St block.");
   }
 
   lines.push(
-    `**Property records:** The SF Recorder has no public API. Search https://recorder.sfgov.org by name for: ` +
+    `**Property records:** No public API. Search https://recorder.sfgov.org by name for: ` +
     `Fillmore Reserve, North Room LLC, Pointed Blue LLC, Shaded Flame LLC, Temperate Lands LLC, White Birches LLC, Aegis Reserve.`
   );
 
@@ -555,7 +516,7 @@ async function main() {
 
   const matches = await fetchAndMatch();
   const total = Object.values(matches).reduce((s, a) => s + a.length, 0);
-  console.log(`\n✅ Total targeted matches: ${total}`);
+  console.log(`\n✅ Total matches: ${total}`);
 
   const embeds = [
     coverEmbed(matches, runDate),
@@ -565,6 +526,11 @@ async function main() {
     networkEmbed(matches),
     briefingEmbed(matches, runDate),
   ];
+
+  embeds.forEach((e, i) => {
+    const size = JSON.stringify(e).length;
+    console.log(`Embed ${i+1} "${e.title}": ${size} chars ${size > 6000 ? "⚠️ TOO BIG" : "✅"}`);
+  });
 
   console.log(`\n📨 Posting ${embeds.length} embeds…`);
   await postToDiscord(embeds);
