@@ -2,19 +2,10 @@
  * SF Fillmore Research Report
  *
  * A one-time script that pulls ALL matching records across all 4 SF open
- * data sources from as far back as the datasets go, synthesizes them into
- * a comprehensive intelligence report, and posts it to Discord as a
- * structured, reporter-ready briefing.
+ * data sources and synthesizes them into a comprehensive intelligence report
+ * posted to Discord as a structured, reporter-ready briefing.
  *
- * Run once. That's it.
- *
- * Categories:
- *   1. Lobbying Activity       — who is lobbying whom, on what, since when
- *   2. Political Money         — all contributions tied to tracked entities
- *   3. Permit & Construction   — every permit filed on tracked properties
- *   4. Property Transactions   — all recorded deeds and transfers
- *   5. Key People & Networks   — entities, firms, officials that recur
- *   6. Reporter's Briefing     — plain-language synthesis
+ * Run once manually from GitHub Actions. That's it.
  */
 
 const fs    = require("fs");
@@ -24,9 +15,6 @@ const https = require("https");
 // ─── Configuration ────────────────────────────────────────────────────────────
 
 const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL;
-
-// Pull everything — no date filter. DataSF datasets go back years.
-// Set to a specific year like "2020-01-01" to narrow if datasets are huge.
 const SINCE_DATE = process.env.SINCE_DATE || "2018-01-01";
 
 const SEARCH_TERMS = [
@@ -54,6 +42,7 @@ const SOURCES = [
     label: "Lobbyist Activity",
     url: "https://data.sfgov.org/resource/s4ub-8j3t.json",
     dateField: "date",
+    // Confirmed field names from DataSF lobbyist dataset
     textFields: ["lobbyistname", "firmname", "clientname", "description", "employeename", "candidatename"],
     linkTemplate: (r) =>
       r.fromfiling
@@ -65,18 +54,33 @@ const SOURCES = [
     label: "Campaign Finance",
     url: "https://data.sfgov.org/resource/pitq-e56w.json",
     dateField: "filing_date",
-    textFields: ["filer_naml", "filer_namf", "tran_naml", "tran_namf", "tran_emp", "tran_occ"],
+    // Confirmed field names from DataSF campaign finance transactions dataset
+    textFields: [
+      "filer_name",
+      "transaction_first_name",
+      "transaction_last_name",
+      "transaction_employer",
+      "transaction_occupation",
+      "transaction_description",
+    ],
     linkTemplate: (r) =>
-      r.filing_id
-        ? `https://netfile.com/pub2/api/filing/${r.filing_id}/detail?aid=sfo`
+      r.filing_id_number
+        ? `https://netfile.com/pub2/api/filing/${r.filing_id_number}/detail?aid=sfo`
         : "https://sfethics.org/disclosures/campaign-finance-disclosure",
+    // Helper to extract amount and names for display
+    getAmount: (r) => Number(r.transaction_amount_1 || 0),
+    getContributor: (r) =>
+      [r.transaction_first_name, r.transaction_last_name].filter(Boolean).join(" ") || "Unknown",
+    getRecipient: (r) => r.filer_name || "Unknown Committee",
+    getDate: (r) => r.transaction_date ? r.transaction_date.slice(0, 10) : (r.filing_date ? r.filing_date.slice(0, 10) : "—"),
   },
   {
     id: "building_permits",
     label: "Building Permits",
     url: "https://data.sfgov.org/resource/i98e-djp9.json",
     dateField: "filed_date",
-    textFields: ["applicant_name", "owner_name", "description", "contractor_name", "street_name"],
+    // Confirmed field names — no applicant_name or owner_name in this dataset
+    textFields: ["description", "street_name"],
     linkTemplate: (r) =>
       r.permit_number
         ? `https://dbiweb02.sfgov.org/dbipts/default.aspx?permit=${r.permit_number}`
@@ -85,9 +89,11 @@ const SOURCES = [
   {
     id: "property_transfers",
     label: "Property Transfers",
+    // SF Assessor Recorded Documents — confirmed dataset
+    // Note: wv5m-vpq2 had 0 rows; using the correct Assessor dataset
     url: "https://data.sfgov.org/resource/wv5m-vpq2.json",
-    dateField: "recording_date",
-    textFields: ["grantor_names", "grantee_names", "document_type", "legal_description"],
+    dateField: "recorded_datetime",
+    textFields: ["grantor_names", "grantee_names", "document_type_description", "legal_description"],
     linkTemplate: (r) =>
       r.document_number
         ? `https://recorder.sfgov.org/document-detail?documentNumber=${r.document_number}`
@@ -145,7 +151,7 @@ function matchedTerms(row, textFields) {
   return SEARCH_TERMS.filter((t) => haystack.includes(t.toLowerCase()));
 }
 
-// ─── Data fetching — no lookback limit, paginated ─────────────────────────────
+// ─── Data fetching — paginated, no lookback limit ─────────────────────────────
 
 async function fetchAllMatches() {
   const results = {
@@ -175,7 +181,6 @@ async function fetchAllMatches() {
       }
 
       if (!Array.isArray(rows) || rows.length === 0) break;
-
       totalFetched += rows.length;
 
       for (const row of rows) {
@@ -185,10 +190,8 @@ async function fetchAllMatches() {
         }
       }
 
-      if (rows.length < limit) break; // last page
+      if (rows.length < limit) break;
       offset += limit;
-
-      // Polite pause between pages
       await new Promise((r) => setTimeout(r, 300));
     }
 
@@ -198,14 +201,41 @@ async function fetchAllMatches() {
   return results;
 }
 
-// ─── Synthesis helpers ────────────────────────────────────────────────────────
+// ─── Formatting helpers ───────────────────────────────────────────────────────
 
-function truncate(str, max = 3900) {
-  return str.length > max ? str.slice(0, max - 3) + "…" : str;
+// Discord hard limits: embed description 4096 chars, field value 1024 chars
+// We stay well under by truncating at 3800 and splitting into multiple embeds
+function truncate(str, max = 3800) {
+  if (str.length <= max) return str;
+  return str.slice(0, max - 4) + "\n…";
 }
 
 function bold(s) { return `**${s}**`; }
 function mono(s) { return `\`${s}\``; }
+
+// Split a long text block into multiple embed descriptions of max `maxLen` chars
+function splitIntoEmbeds(title, color, fullText, maxLen = 3800) {
+  if (fullText.length <= maxLen) {
+    return [{ title, color, description: fullText }];
+  }
+  const chunks = [];
+  let remaining = fullText;
+  let part = 1;
+  while (remaining.length > 0) {
+    const chunk = remaining.slice(0, maxLen);
+    // Try to break at a newline
+    const lastNewline = chunk.lastIndexOf("\n");
+    const breakAt = lastNewline > maxLen * 0.7 ? lastNewline : maxLen;
+    chunks.push(remaining.slice(0, breakAt));
+    remaining = remaining.slice(breakAt).trimStart();
+    part++;
+  }
+  return chunks.map((text, i) => ({
+    title: chunks.length > 1 ? `${title} (${i + 1}/${chunks.length})` : title,
+    color,
+    description: text,
+  }));
+}
 
 // ─── Section builders ─────────────────────────────────────────────────────────
 
@@ -218,12 +248,11 @@ function buildCoverEmbed(matches, runDate) {
   };
   const total = Object.values(totals).reduce((a, b) => a + b, 0);
 
-  // Earliest date found across all sources
   const allDates = [
     ...matches.lobbyist_activity.map(({ row }) => row.date),
     ...matches.campaign_finance.map(({ row }) => row.filing_date),
     ...matches.building_permits.map(({ row }) => row.filed_date),
-    ...matches.property_transfers.map(({ row }) => row.recording_date),
+    ...matches.property_transfers.map(({ row }) => row.recorded_datetime),
   ].filter(Boolean).map((d) => d.slice(0, 10)).sort();
 
   const earliest = allDates[0] || "—";
@@ -249,16 +278,12 @@ function buildCoverEmbed(matches, runDate) {
   };
 }
 
-function buildLobbyingEmbed(lobbyistMatches) {
+function buildLobbyingEmbeds(lobbyistMatches) {
   if (lobbyistMatches.length === 0) {
-    return [{
-      title: "🏛 1. Lobbying Activity",
-      color: 0xe74c3c,
-      description: "No lobbying records found matching tracked entities.",
-    }];
+    return [{ title: "🏛 1. Lobbying Activity", color: 0xe74c3c,
+      description: "No lobbying records found." }];
   }
 
-  // Group by firm → lobbyist → client → activities
   const byFirm = new Map();
   for (const { row, terms, link } of lobbyistMatches) {
     const firm = row.firmname || "Independent";
@@ -268,155 +293,123 @@ function buildLobbyingEmbed(lobbyistMatches) {
     const date = row.date ? row.date.slice(0, 10) : "—";
     const official = row.employeename || row.candidatename || null;
 
-    const key = firm;
-    if (!byFirm.has(key)) byFirm.set(key, { firm, lobbyists: new Map() });
-    const firmEntry = byFirm.get(key);
-    if (!firmEntry.lobbyists.has(lobbyist)) firmEntry.lobbyists.set(lobbyist, new Map());
-    const lobbyistEntry = firmEntry.lobbyists.get(lobbyist);
+    if (!byFirm.has(firm)) byFirm.set(firm, new Map());
+    const firmEntry = byFirm.get(firm);
+    if (!firmEntry.has(lobbyist)) firmEntry.set(lobbyist, new Map());
+    const lobbyistEntry = firmEntry.get(lobbyist);
     if (!lobbyistEntry.has(client)) lobbyistEntry.set(client, []);
     lobbyistEntry.get(client).push({ desc, date, official, terms, link });
   }
 
-  // Collect all officials ever contacted
   const officialsContacted = new Map();
-  for (const { row, link } of lobbyistMatches) {
+  for (const { row } of lobbyistMatches) {
     const name = row.employeename || row.candidatename;
     if (name && name.trim()) {
       if (!officialsContacted.has(name)) {
-        officialsContacted.set(name, { count: 0, clients: new Set(), links: [] });
+        officialsContacted.set(name, { count: 0, clients: new Set() });
       }
-      const e = officialsContacted.get(name);
-      e.count++;
-      if (row.clientname) e.clients.add(row.clientname);
-      e.links.push(link);
+      officialsContacted.get(name).count++;
+      if (row.clientname) officialsContacted.get(name).clients.add(row.clientname);
     }
   }
 
-  // Date range of lobbying
-  const dates = lobbyistMatches
-    .map(({ row }) => row.date).filter(Boolean).map((d) => d.slice(0, 10)).sort();
-  const firstFiling = dates[0] || "—";
-  const lastFiling = dates[dates.length - 1] || "—";
+  const dates = lobbyistMatches.map(({ row }) => row.date).filter(Boolean)
+    .map((d) => d.slice(0, 10)).sort();
 
   let desc =
-    `**${lobbyistMatches.length} total lobbying disclosure(s)** spanning ` +
-    `${firstFiling} → ${lastFiling}\n\n`;
+    `**${lobbyistMatches.length} total lobbying disclosure(s)** | ` +
+    `${dates[0] || "—"} → ${dates[dates.length - 1] || "—"}\n\n`;
 
-  for (const { firm, lobbyists } of byFirm.values()) {
+  for (const [firm, lobbyists] of byFirm) {
     desc += `### ${firm}\n`;
     for (const [lobbyist, clients] of lobbyists) {
-      desc += `**Lobbyist:** ${lobbyist}\n`;
+      desc += `**${lobbyist}**\n`;
       for (const [client, activities] of clients) {
-        desc += `↳ **Client:** ${client} — ${activities.length} filing(s)\n`;
-        // Show up to 5 most recent activities
+        desc += `↳ Client: **${client}** — ${activities.length} filing(s)\n`;
         const sorted = activities.sort((a, b) => b.date.localeCompare(a.date));
-        for (const { date, desc: actDesc, official, link } of sorted.slice(0, 5)) {
+        for (const { date, desc: actDesc, official, link } of sorted.slice(0, 4)) {
           desc += `  • ${date}`;
-          if (official) desc += ` | Official contacted: ${bold(official)}`;
-          if (actDesc !== "—") desc += ` | ${actDesc.slice(0, 80)}`;
+          if (official) desc += ` | Official: **${official}**`;
+          if (actDesc !== "—") desc += ` | ${actDesc.slice(0, 70)}`;
           desc += ` [↗](${link})\n`;
         }
-        if (activities.length > 5) {
-          desc += `  • …and ${activities.length - 5} earlier filing(s)\n`;
-        }
+        if (activities.length > 4) desc += `  • …and ${activities.length - 4} more\n`;
       }
       desc += "\n";
     }
   }
 
-  const embeds = [{
-    title: "🏛 1. Lobbying Activity",
-    color: 0xe74c3c,
-    description: truncate(desc),
-  }];
+  const embeds = splitIntoEmbeds("🏛 1. Lobbying Activity", 0xe74c3c, desc);
 
-  // Officials sub-embed if there are any
   if (officialsContacted.size > 0) {
-    let oDesc = `**${officialsContacted.size} city official(s) contacted** across all lobbying filings:\n\n`;
-    const sorted = [...officialsContacted.entries()]
-      .sort((a, b) => b[1].count - a[1].count);
-    for (const [name, { count, clients }] of sorted) {
-      oDesc += `• ${bold(name)} — contacted ${count} time(s)`;
-      if (clients.size > 0) oDesc += ` on behalf of ${[...clients].join(", ")}`;
-      oDesc += "\n";
-    }
-    embeds.push({
-      title: "🏛 1b. City Officials Contacted",
-      color: 0xc0392b,
-      description: truncate(oDesc),
-    });
+    let oDesc = `**${officialsContacted.size} city official(s) contacted:**\n\n`;
+    [...officialsContacted.entries()]
+      .sort((a, b) => b[1].count - a[1].count)
+      .forEach(([name, { count, clients }]) => {
+        oDesc += `• **${name}** — ${count} contact(s)`;
+        if (clients.size > 0) oDesc += ` on behalf of ${[...clients].join(", ")}`;
+        oDesc += "\n";
+      });
+    embeds.push(...splitIntoEmbeds("🏛 1b. City Officials Contacted", 0xc0392b, oDesc));
   }
 
   return embeds;
 }
 
-function buildFinanceEmbed(financeMatches) {
+function buildFinanceEmbeds(financeMatches, source) {
   if (financeMatches.length === 0) {
-    return [{
-      title: "💰 2. Campaign Finance",
-      color: 0x27ae60,
-      description: "No campaign finance records found matching tracked entities.",
-    }];
+    return [{ title: "💰 2. Campaign Finance", color: 0x27ae60,
+      description: "No campaign finance records found." }];
   }
 
   const contributions = financeMatches.map(({ row, terms, link }) => ({
-    contributor: [row.tran_namf, row.tran_naml].filter(Boolean).join(" ") || "Unknown",
-    employer: row.tran_emp || "—",
-    recipient: row.filer_naml || "Unknown Committee",
-    amount: Number(row.tran_amt1 || 0),
-    date: row.filing_date ? row.filing_date.slice(0, 10) : "—",
-    formType: row.form_type || "—",
+    contributor: source.getContributor(row),
+    employer: row.transaction_employer || "—",
+    recipient: source.getRecipient(row),
+    amount: source.getAmount(row),
+    date: source.getDate(row),
     terms,
     link,
   })).sort((a, b) => b.amount - a.amount);
 
   const totalAmount = contributions.reduce((s, r) => s + r.amount, 0);
 
-  // Group by recipient committee
   const byRecipient = new Map();
   for (const c of contributions) {
     if (!byRecipient.has(c.recipient)) byRecipient.set(c.recipient, []);
     byRecipient.get(c.recipient).push(c);
   }
 
-  const dates = contributions.map((c) => c.date).filter(Boolean).sort();
+  const dates = contributions.map((c) => c.date).filter((d) => d !== "—").sort();
 
   let desc =
     `**${contributions.length} transaction(s)** | ` +
-    `**Total tracked: $${totalAmount.toLocaleString()}** | ` +
+    `**Total: $${totalAmount.toLocaleString()}** | ` +
     `${dates[0] || "—"} → ${dates[dates.length - 1] || "—"}\n\n`;
 
-  // By recipient
-  desc += `**Breakdown by recipient committee:**\n`;
   for (const [recipient, contribs] of [...byRecipient.entries()]
-    .sort((a, b) => b[1].reduce((s, r) => s + r.amount, 0) - a[1].reduce((s, r) => s + r.amount, 0))) {
+    .sort((a, b) =>
+      b[1].reduce((s, r) => s + r.amount, 0) - a[1].reduce((s, r) => s + r.amount, 0))) {
     const subtotal = contribs.reduce((s, r) => s + r.amount, 0);
-    desc += `\n**→ ${recipient}** — $${subtotal.toLocaleString()} across ${contribs.length} transaction(s)\n`;
-    for (const { contributor, employer, amount, date, link } of contribs.slice(0, 6)) {
-      desc += `  • ${date} | ${bold(contributor)}`;
+    desc += `**→ ${recipient}** — $${subtotal.toLocaleString()} (${contribs.length} transaction(s))\n`;
+    for (const { contributor, employer, amount, date, link } of contribs.slice(0, 5)) {
+      desc += `  • ${date} | **${contributor}**`;
       if (employer !== "—") desc += ` (${employer})`;
       desc += ` | $${amount.toLocaleString()} [↗](${link})\n`;
     }
-    if (contribs.length > 6) desc += `  • …and ${contribs.length - 6} more\n`;
+    if (contribs.length > 5) desc += `  • …and ${contribs.length - 5} more\n`;
+    desc += "\n";
   }
 
-  return [{
-    title: "💰 2. Campaign Finance",
-    color: 0x27ae60,
-    description: truncate(desc),
-  }];
+  return splitIntoEmbeds("💰 2. Campaign Finance", 0x27ae60, desc);
 }
 
-function buildPermitsEmbed(permitMatches) {
+function buildPermitsEmbeds(permitMatches) {
   if (permitMatches.length === 0) {
-    return [{
-      title: "🏗 3. Permit & Construction Activity",
-      color: 0xf39c12,
-      description: "No building permit records found matching tracked entities.",
-    }];
+    return [{ title: "🏗 3. Building Permits", color: 0xf39c12,
+      description: "No building permit records found." }];
   }
 
-  // Group by address
   const byAddress = new Map();
   for (const { row, terms, link } of permitMatches) {
     const address = [row.street_number, row.street_name, row.street_suffix]
@@ -424,8 +417,7 @@ function buildPermitsEmbed(permitMatches) {
     if (!byAddress.has(address)) byAddress.set(address, []);
     byAddress.get(address).push({
       permitNum: row.permit_number || "—",
-      desc: (row.description || "—").slice(0, 120),
-      applicant: row.applicant_name || row.owner_name || "—",
+      desc: (row.description || "—").slice(0, 100),
       status: row.status || "—",
       date: row.filed_date ? row.filed_date.slice(0, 10) : "—",
       completedDate: row.completed_date ? row.completed_date.slice(0, 10) : null,
@@ -435,63 +427,51 @@ function buildPermitsEmbed(permitMatches) {
     });
   }
 
-  const dates = permitMatches
-    .map(({ row }) => row.filed_date).filter(Boolean).map((d) => d.slice(0, 10)).sort();
+  const dates = permitMatches.map(({ row }) => row.filed_date)
+    .filter(Boolean).map((d) => d.slice(0, 10)).sort();
 
   let desc =
-    `**${permitMatches.length} permit record(s)** across **${byAddress.size} address(es)** | ` +
+    `**${permitMatches.length} permit(s)** across **${byAddress.size} address(es)** | ` +
     `${dates[0] || "—"} → ${dates[dates.length - 1] || "—"}\n\n`;
 
   for (const [address, permits] of byAddress) {
-    desc += `📍 **${address}** — ${permits.length} permit(s)\n`;
-    const sorted = permits.sort((a, b) => b.date.localeCompare(a.date));
-    for (const { permitNum, desc: pDesc, applicant, status, date, completedDate, estimatedCost, link } of sorted) {
-      desc += `  • ${mono(permitNum)} | ${bold(status)} | Filed: ${date}`;
-      if (completedDate) desc += ` | Completed: ${completedDate}`;
-      if (estimatedCost) desc += ` | Est. cost: ${estimatedCost}`;
-      desc += `\n    Applicant: ${applicant}\n`;
-      desc += `    Work: ${pDesc} [↗](${link})\n`;
+    desc += `📍 **${address}** (${permits.length} permit(s))\n`;
+    for (const { permitNum, desc: pDesc, status, date, completedDate, estimatedCost, link } of
+      permits.sort((a, b) => b.date.localeCompare(a.date))) {
+      desc += `  • ${mono(permitNum)} | **${status}** | ${date}`;
+      if (completedDate) desc += ` → ${completedDate}`;
+      if (estimatedCost) desc += ` | ${estimatedCost}`;
+      desc += `\n    ${pDesc} [↗](${link})\n`;
     }
     desc += "\n";
   }
 
-  return [{
-    title: "🏗 3. Permit & Construction Activity",
-    color: 0xf39c12,
-    description: truncate(desc),
-  }];
+  return splitIntoEmbeds("🏗 3. Building Permits", 0xf39c12, desc);
 }
 
-function buildTransfersEmbed(transferMatches) {
+function buildTransfersEmbeds(transferMatches) {
   if (transferMatches.length === 0) {
-    return [{
-      title: "🏠 4. Property Transactions",
-      color: 0x9b59b6,
-      description: "No property transfer records found matching tracked entities.",
-    }];
+    return [{ title: "🏠 4. Property Transactions", color: 0x9b59b6,
+      description: "No property transfer records found." }];
   }
 
   const transfers = transferMatches.map(({ row, terms, link }) => ({
-    docType: row.document_type || "—",
+    docType: row.document_type_description || row.document_type || "—",
     buyer: row.grantee_names || "—",
     seller: row.grantor_names || "—",
-    date: row.recording_date ? row.recording_date.slice(0, 10) : "—",
+    date: row.recorded_datetime ? row.recorded_datetime.slice(0, 10) : "—",
     docNumber: row.document_number || "—",
-    legalDesc: (row.legal_description || "").slice(0, 100),
     terms,
     link,
   })).sort((a, b) => b.date.localeCompare(a.date));
 
-  // Group by document type
+  let desc = `**${transfers.length} recorded document(s)**\n\n`;
+
   const byType = new Map();
   for (const t of transfers) {
     if (!byType.has(t.docType)) byType.set(t.docType, []);
     byType.get(t.docType).push(t);
   }
-
-  let desc =
-    `**${transfers.length} recorded document(s)** | ` +
-    `${transfers[transfers.length - 1]?.date || "—"} → ${transfers[0]?.date || "—"}\n\n`;
 
   for (const [docType, docs] of byType) {
     desc += `**${docType}** (${docs.length})\n`;
@@ -503,127 +483,90 @@ function buildTransfersEmbed(transferMatches) {
     desc += "\n";
   }
 
-  return [{
-    title: "🏠 4. Property Transactions",
-    color: 0x9b59b6,
-    description: truncate(desc),
-  }];
+  return splitIntoEmbeds("🏠 4. Property Transactions", 0x9b59b6, desc);
 }
 
-function buildNetworkEmbed(matches) {
-  // Count how many times each tracked term appears across all sources
+function buildNetworkEmbeds(matches) {
   const termCounts = new Map(SEARCH_TERMS.map((t) => [t, 0]));
-  for (const source of SOURCES) {
-    for (const { terms } of matches[source.id]) {
-      for (const t of terms) termCounts.set(t, (termCounts.get(t) || 0) + 1);
-    }
-  }
-
-  // Which terms appear across multiple source types (cross-source presence = more significant)
   const termSources = new Map(SEARCH_TERMS.map((t) => [t, new Set()]));
+
   for (const source of SOURCES) {
     for (const { terms } of matches[source.id]) {
-      for (const t of terms) termSources.get(t)?.add(source.id);
+      for (const t of terms) {
+        termCounts.set(t, (termCounts.get(t) || 0) + 1);
+        termSources.get(t)?.add(source.id);
+      }
     }
   }
 
-  // Unique lobbyist firms
-  const firms = [...new Set(
-    matches.lobbyist_activity.map(({ row }) => row.firmname).filter(Boolean)
-  )];
+  const sourceLabel = {
+    lobbyist_activity: "Lobbying",
+    campaign_finance: "Finance",
+    building_permits: "Permits",
+    property_transfers: "Property",
+  };
 
-  // Unique clients
-  const clients = [...new Set(
-    matches.lobbyist_activity.map(({ row }) => row.clientname).filter(Boolean)
-  )];
-
-  // Unique campaign recipients
-  const recipients = [...new Set(
-    matches.campaign_finance.map(({ row }) => row.filer_naml).filter(Boolean)
-  )];
+  const firms = [...new Set(matches.lobbyist_activity.map(({ row }) => row.firmname).filter(Boolean))];
+  const clients = [...new Set(matches.lobbyist_activity.map(({ row }) => row.clientname).filter(Boolean))];
+  const recipients = [...new Set(matches.campaign_finance.map(({ row }) => row.filer_name).filter(Boolean))];
 
   let desc = `**Entity frequency across all public records:**\n\n`;
 
-  const sorted = [...termCounts.entries()]
-    .filter(([, count]) => count > 0)
-    .sort((a, b) => b[1] - a[1]);
-
-  for (const [term, count] of sorted) {
-    const sources = [...(termSources.get(term) || [])];
-    const sourceLabels = sources.map((s) => ({
-      lobbyist_activity: "Lobbying",
-      campaign_finance: "Finance",
-      building_permits: "Permits",
-      property_transfers: "Property",
-    }[s])).join(", ");
-    desc += `• ${bold(term)}: **${count}** record(s) in [${sourceLabels || "—"}]\n`;
-  }
-
-  if (sorted.length === 0) desc += "_No terms matched any records._\n";
+  [...termCounts.entries()]
+    .filter(([, c]) => c > 0)
+    .sort((a, b) => b[1] - a[1])
+    .forEach(([term, count]) => {
+      const sources = [...(termSources.get(term) || [])].map((s) => sourceLabel[s]).join(", ");
+      desc += `• **${term}**: **${count}** record(s) [${sources || "—"}]\n`;
+    });
 
   if (firms.length > 0) {
-    desc += `\n**Lobbying firms active on behalf of tracked entities:**\n`;
+    desc += `\n**Lobbying firms active for tracked entities:**\n`;
     firms.forEach((f) => { desc += `• ${f}\n`; });
   }
-
   if (clients.length > 0) {
-    desc += `\n**Clients listed in lobbying filings:**\n`;
+    desc += `\n**Clients in lobbying filings:**\n`;
     clients.forEach((c) => { desc += `• ${c}\n`; });
   }
-
   if (recipients.length > 0) {
     desc += `\n**Campaign committees receiving tracked contributions:**\n`;
     recipients.forEach((r) => { desc += `• ${r}\n`; });
   }
 
-  return [{
-    title: "🕸 5. Key Entities & Network Map",
-    color: 0x2980b9,
-    description: truncate(desc),
-  }];
+  return splitIntoEmbeds("🕸 5. Entity Network Map", 0x2980b9, desc);
 }
 
 function buildBriefingEmbed(matches, runDate) {
+  const financeSource = SOURCES.find((s) => s.id === "campaign_finance");
   const lobbyCount = matches.lobbyist_activity.length;
   const financeCount = matches.campaign_finance.length;
   const permitCount = matches.building_permits.length;
   const transferCount = matches.property_transfers.length;
 
-  const firms = [...new Set(
-    matches.lobbyist_activity.map(({ row }) => row.firmname).filter(Boolean)
+  const firms = [...new Set(matches.lobbyist_activity.map(({ row }) => row.firmname).filter(Boolean))];
+  const clients = [...new Set(matches.lobbyist_activity.map(({ row }) => row.clientname).filter(Boolean))];
+  const officials = [...new Set(
+    matches.lobbyist_activity.map(({ row }) => row.employeename || row.candidatename).filter(Boolean)
   )];
-  const clients = [...new Set(
-    matches.lobbyist_activity.map(({ row }) => row.clientname).filter(Boolean)
-  )];
-  const officialsSet = new Set(
-    matches.lobbyist_activity
-      .map(({ row }) => row.employeename || row.candidatename)
-      .filter(Boolean)
-  );
-  const totalMoney = matches.campaign_finance
-    .reduce((s, { row }) => s + Number(row.tran_amt1 || 0), 0);
-  const recipients = [...new Set(
-    matches.campaign_finance.map(({ row }) => row.filer_naml).filter(Boolean)
-  )];
+  const totalMoney = matches.campaign_finance.reduce((s, { row }) =>
+    s + Number(row.transaction_amount_1 || 0), 0);
+  const recipients = [...new Set(matches.campaign_finance.map(({ row }) => row.filer_name).filter(Boolean))];
   const permitAddresses = [...new Set(
     matches.building_permits.map(({ row }) =>
-      [row.street_number, row.street_name].filter(Boolean).join(" ")
-    ).filter(Boolean)
+      [row.street_number, row.street_name].filter(Boolean).join(" ")).filter(Boolean)
   )];
 
   const lines = [];
 
   if (lobbyCount > 0) {
     lines.push(
-      `**Lobbying:** ${firms.join(" and ")} ha${firms.length === 1 ? "s" : "ve"} filed ` +
-      `**${lobbyCount} lobbying disclosure(s)** with the SF Ethics Commission on behalf of ` +
-      `${clients.join(", ")}. ` +
-      (officialsSet.size > 0
-        ? `City officials contacted include: ${[...officialsSet].join(", ")}.`
+      `**Lobbying:** ${firms.length > 0 ? firms.join(" and ") : "Unknown firm(s)"} filed ` +
+      `**${lobbyCount} lobbying disclosure(s)** on behalf of ${clients.join(", ") || "unknown clients"}. ` +
+      (officials.length > 0
+        ? `City officials contacted include: ${officials.slice(0, 5).join(", ")}${officials.length > 5 ? " and others" : ""}.`
         : "No city official contact records found.")
     );
   }
-
   if (financeCount > 0) {
     lines.push(
       `**Political money:** Tracked entities are associated with **$${totalMoney.toLocaleString()}** ` +
@@ -631,25 +574,22 @@ function buildBriefingEmbed(matches, runDate) {
       `${recipients.length > 0 ? recipients.join(", ") : "unknown committees"}.`
     );
   }
-
   if (permitCount > 0) {
     lines.push(
-      `**Construction:** **${permitCount} building permit(s)** have been filed at ` +
+      `**Construction:** **${permitCount} building permit(s)** filed at ` +
       `${permitAddresses.length > 0
         ? permitAddresses.slice(0, 5).join("; ") + (permitAddresses.length > 5 ? " and others" : "")
         : "tracked addresses"}.`
     );
   }
-
   if (transferCount > 0) {
     lines.push(
-      `**Property:** **${transferCount} recorded document(s)** — deeds, transfers, and other ` +
-      `instruments — involving tracked entities appear in the SF Assessor-Recorder's database.`
+      `**Property:** **${transferCount} recorded document(s)** involving tracked entities ` +
+      `appear in the SF Assessor-Recorder database.`
     );
   }
-
   if (lines.length === 0) {
-    lines.push("No records matched across any of the four data sources for the tracked entities.");
+    lines.push("No records matched across any of the four data sources.");
   }
 
   return [{
@@ -658,11 +598,9 @@ function buildBriefingEmbed(matches, runDate) {
     description:
       `_Comprehensive plain-language synthesis as of ${runDate}:_\n\n` +
       lines.join("\n\n") +
-      `\n\n---\n_This is a one-time snapshot report. All source data is from DataSF open data portals. ` +
-      `Individual filing links point directly to source records._`,
-    footer: {
-      text: `SF Fillmore Intelligence Report • Generated ${runDate}`,
-    },
+      `\n\n---\n_One-time snapshot. All data from DataSF open data. ` +
+      `Individual filing links go directly to source records._`,
+    footer: { text: `SF Fillmore Intelligence Report • Generated ${runDate}` },
   }];
 }
 
@@ -671,7 +609,6 @@ function buildBriefingEmbed(matches, runDate) {
 async function postToDiscord(embeds) {
   if (!DISCORD_WEBHOOK_URL) {
     console.log("\n[DRY RUN] Would post", embeds.length, "embeds to Discord.");
-    console.log(JSON.stringify(embeds, null, 2));
     return;
   }
 
@@ -680,7 +617,7 @@ async function postToDiscord(embeds) {
     const batch = embeds.slice(i, i + BATCH_SIZE);
     const result = await postJSON(DISCORD_WEBHOOK_URL, { embeds: batch });
     if (result.status >= 300) {
-      console.error(`Discord error ${result.status}:`, result.body);
+      console.error(`Discord error ${result.status} on batch ${Math.floor(i/BATCH_SIZE)+1}:`, result.body);
     } else {
       console.log(`✅ Posted embed batch ${Math.floor(i / BATCH_SIZE) + 1} of ${Math.ceil(embeds.length / BATCH_SIZE)}`);
     }
@@ -713,13 +650,15 @@ async function main() {
 
   console.log(`\n✅ Total matches across all sources: ${total}`);
 
+  const financeSource = SOURCES.find((s) => s.id === "campaign_finance");
+
   const embeds = [
     buildCoverEmbed(matches, runDate),
-    ...buildLobbyingEmbed(matches.lobbyist_activity),
-    ...buildFinanceEmbed(matches.campaign_finance),
-    ...buildPermitsEmbed(matches.building_permits),
-    ...buildTransfersEmbed(matches.property_transfers),
-    ...buildNetworkEmbed(matches),
+    ...buildLobbyingEmbeds(matches.lobbyist_activity),
+    ...buildFinanceEmbeds(matches.campaign_finance, financeSource),
+    ...buildPermitsEmbeds(matches.building_permits),
+    ...buildTransfersEmbeds(matches.property_transfers),
+    ...buildNetworkEmbeds(matches),
     ...buildBriefingEmbed(matches, runDate),
   ];
 
